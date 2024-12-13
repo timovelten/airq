@@ -1,0 +1,10 @@
+[package]
+name = "scd30"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+embedded-hal-async.workspace = true
+num_enum.workspace = true
+crc = "3.2.1"
+defmt = { workspace = true }

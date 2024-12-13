@@ -1,0 +1,25 @@
+[package]
+name = "sps30"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = { workspace = true }
+num_enum = { workspace = true }
+heapless = { workspace = true }
+embedded-io = { workspace = true }
+embedded-io-async = {workspace = true }
+embedded-hal-async.workspace = true
+defmt = { workspace = true }
+
+[dev-dependencies]
+assert_matches = "1.5.0"
+rand = { version = "0.8.5", features = ["small_rng"] }
+smol = "2.0.2"
+smol-macros = "0.1.1"
+macro_rules_attribute = "0.2.0"
+test-log = "0.2.16"
+
+[dev-dependencies.embedded-io-async]
+version = "*"
+features = ["alloc"]
