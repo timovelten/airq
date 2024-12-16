@@ -1,5 +1,6 @@
 use bt_hci::controller::ExternalController;
 use cyw43::bluetooth::BtDriver;
+use defmt::debug;
 use defmt::info;
 use defmt::Debug2Format;
 use embassy_futures::select::select;
@@ -33,7 +34,7 @@ struct Server {
 ///
 /// Note that we do not use the environmental sensing service profile, because they are not allowed to expose co2 and also
 /// we have to implement sfloat (and that is kind of a weird format tbh)
-#[gatt_service(uuid = "0e201142-fba1-43a9-b7c9-49020bec9e30")]
+#[gatt_service(uuid = "0e201142-fba1-43a9-b7c9-49020b000000")]
 struct CustomService {
     /// org.bluetooth.characteristic.temperature,
     ///
@@ -54,19 +55,19 @@ struct CustomService {
     co2: u16,
 
     /// Custom, same encoding as temperature and humidity, i.e. two decimal places
-    #[characteristic(uuid = "0e201142-fba1-43a9-b7c9-49020bec9e35", read, notify)]
+    #[characteristic(uuid = "0e201142-fba1-43a9-b7c9-49020b000001", read, notify)]
     pm1: u16,
 
     /// Custom, same encoding as temperature and humidity, i.e. two decimal places
-    #[characteristic(uuid = "0e201142-fba1-43a9-b7c9-49020bec9e36", read, notify)]
+    #[characteristic(uuid = "0e201142-fba1-43a9-b7c9-49020b000002", read, notify)]
     pm2: u16,
 
     /// Custom, same encoding as temperature and humidity, i.e. two decimal places
-    #[characteristic(uuid = "0e201142-fba1-43a9-b7c9-49020bec9e36", read, notify)]
+    #[characteristic(uuid = "0e201142-fba1-43a9-b7c9-49020b000004", read, notify)]
     pm4: u16,
 
     /// Custom, same encoding as temperature and humidity, i.e. two decimal places
-    #[characteristic(uuid = "0e201142-fba1-43a9-b7c9-49020bec9e36", read, notify)]
+    #[characteristic(uuid = "0e201142-fba1-43a9-b7c9-49020b000010", read, notify)]
     pm10: u16,
 }
 
@@ -134,10 +135,13 @@ async fn update_pm<C: Controller>(
         let pm4 = (values.mass_pm4 * 100.0) as u16;
         let pm10 = (values.mass_pm10 * 100.0) as u16;
 
-        let _ = server.notify(&service.pm1, &conn, &pm1).await;
-        let _ = server.notify(&service.pm2, &conn, &pm2).await;
-        let _ = server.notify(&service.pm4, &conn, &pm4).await;
-        let _ = server.notify(&service.pm10, &conn, &pm10).await;
+        let r1 = server.notify(&service.pm1, &conn, &pm1).await;
+        let r2 = server.notify(&service.pm2, &conn, &pm2).await;
+        let r3 = server.notify(&service.pm4, &conn, &pm4).await;
+        let r4 = server.notify(&service.pm10, &conn, &pm10).await;
+
+        let failures = (r1.is_ok(), r2.is_ok(), r3.is_ok(), r4.is_ok());
+        debug!("Updated PM {}", failures);
     }
 }
 
@@ -199,7 +203,6 @@ async fn advertise<'a, C: Controller>(
     AdStructure::encode_slice(
         &[
             AdStructure::Flags(LE_GENERAL_DISCOVERABLE | BR_EDR_NOT_SUPPORTED),
-            AdStructure::ServiceUuids16(&[Uuid::Uuid16([0x0f, 0x18])]),
             AdStructure::CompleteLocalName(name.as_bytes()),
         ],
         &mut advertiser_data[..],

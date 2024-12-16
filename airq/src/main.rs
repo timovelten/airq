@@ -131,7 +131,7 @@ async fn measure_pm(uart: BufferedUart<'static, UART0>, signal: &'static Signal<
             Err(err) => info!("SPS30 Error: {}", &err),
         }
 
-        Timer::after_secs(20).await;
+        Timer::after_secs(10).await;
     }
 }
 
@@ -149,6 +149,6 @@ async fn measure_co2(i2c: i2c::I2c<'static, I2C1, i2c::Async>, signal: &'static 
             Err(err) => info!("SCD30 Error: {}", &err),
         }
 
-        Timer::after_secs(20).await;
+        Timer::after_secs(10).await;
     }
 }

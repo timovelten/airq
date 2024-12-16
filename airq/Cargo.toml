@@ -36,3 +36,4 @@ portable-atomic = { version = "1.5", features = ["critical-section"] }
 
 sps30 = { path = "../sps30" }
 scd30 = { path = "../scd30" }
+uuid = { version = "1.11.0", default-features = false }
