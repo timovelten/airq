@@ -9,7 +9,7 @@ use embassy_rp::{
     bind_interrupts, gpio::{Level, Output}, i2c::{self}, peripherals::{DMA_CH0, I2C1, PIO0, UART0}, pio::{self, Pio}, uart::{self, BufferedUart}
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::{Delay, Timer};
+use embassy_time::{with_deadline, Delay, Duration, Instant, Timer};
 use panic_probe as _;
 use rtt_target::rtt_init_defmt;
 use scd30::Scd30;
@@ -27,6 +27,23 @@ bind_interrupts!(struct Irqs {
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
 
 type Signal<T> = embassy_sync::signal::Signal<CriticalSectionRawMutex, T>;
+
+#[derive(Default)]
+struct Signals {
+    pub pm_update: Signal<sps30::Measurement>,
+    pub co2_update: Signal<scd30::Measurement>,
+    pub active_connection: Signal<bool>
+}
+
+impl Signals {
+    pub const fn new() -> Self {
+        Self {
+            pm_update: Signal::new(),
+            co2_update: Signal::new(),
+            active_connection: Signal::new()
+        }
+    }
+}
 
 #[entry]
 fn main() -> ! {
@@ -95,15 +112,11 @@ async fn async_main(spawner: Spawner) {
     );
 
     // Setup the actual application
-    static PM_SIGNAL: StaticCell<Signal<sps30::Measurement>> = StaticCell::new();
-    static CO2_SIGNAL: StaticCell<Signal<scd30::Measurement>> = StaticCell::new();
+    static SIGNALS: Signals = Signals::new();
 
-    let pm_signal: &'static Signal<_> = PM_SIGNAL.init(Default::default());
-    let co2_signal: &'static Signal<_> = CO2_SIGNAL.init(Default::default());
-
-    unwrap!(spawner.spawn(bluetooth::runner(bt_device, pm_signal, co2_signal)));
-    unwrap!(spawner.spawn(measure_pm(uart_sps30, pm_signal)));
-    unwrap!(spawner.spawn(measure_co2(i2c, co2_signal)));
+    unwrap!(spawner.spawn(bluetooth::runner(bt_device, &SIGNALS)));
+    unwrap!(spawner.spawn(measure_pm(uart_sps30, &SIGNALS)));
+    unwrap!(spawner.spawn(measure_co2(i2c, &SIGNALS)));
 }
 
 #[embassy_executor::task]
@@ -112,31 +125,78 @@ async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'stat
 }
 
 #[embassy_executor::task]
-async fn measure_pm(uart: BufferedUart<'static, UART0>, signal: &'static Signal<sps30::Measurement>) {
+async fn measure_pm(uart: BufferedUart<'static, UART0>, signals: &'static Signals) {
     let mut sps30 = Sps30::new(uart, Delay);
 
     // Reset because resetting the pico does not necessarily reset the sensor itself
     // (and calling start measurement if it is already started will result in an error)
     unwrap!(sps30.reset().await);
-    unwrap!(sps30.start_measurement().await);
-    info!("Started SPS30 measurement!");
 
-    Timer::after_millis(2000).await;
+    enum MeasureState {
+        Measure,
+        Idle(embassy_time::Instant),
+        Inactive,
+        Starting,
+        Stopping
+    }
 
+    let mut state = MeasureState::Inactive;
     loop {
-        let measurement = sps30.read_measured_value().await;
-        debug!("SPS30: {}", measurement);
-        match measurement {
-            Ok(m) => signal.signal(m),
-            Err(err) => info!("SPS30 Error: {}", &err),
-        }
+        // Little state machine, yay!
+        match state {
+            MeasureState::Starting => {
+                info!("Starting PM measurement");
+                unwrap!(sps30.start_measurement().await);
 
-        Timer::after_secs(10).await;
+                state = MeasureState::Measure;
+            }
+            MeasureState::Stopping => {
+                info!("Stopping PM measurement");
+                unwrap!(sps30.stop_measurement().await);
+
+                state = MeasureState::Inactive;
+            }
+            MeasureState::Measure => {
+                let measurement = sps30.read_measured_value().await;
+                debug!("SPS30: {}", measurement);
+
+                match measurement {
+                    Ok(m) => signals.pm_update.signal(m),
+                    Err(err) => info!("SPS30 Error: {}", &err),
+                }
+
+                state = MeasureState::Idle(Instant::now() + Duration::from_secs(10));
+
+            }
+            MeasureState::Idle(deadline) => {
+                // Idle between measurements. We either wait for a set time, or find out that we should transition
+                // to a stopped state
+
+                let res = with_deadline(deadline, signals.active_connection.wait()).await;
+                match res {
+                    Ok(true) => {
+                        // Do nothing, measurement stays active. At some point, the deadline will expire and
+                        // we will transition to measure again
+                    },
+                    Ok(false) => {
+                        state = MeasureState::Stopping;
+                    }
+                    Err(_) => {
+                        state = MeasureState::Measure;
+                    }
+                }
+            }
+            MeasureState::Inactive => {
+                if signals.active_connection.wait().await {
+                    state = MeasureState::Starting;
+                }
+            }
+        }
     }
 }
 
 #[embassy_executor::task]
-async fn measure_co2(i2c: i2c::I2c<'static, I2C1, i2c::Async>, signal: &'static Signal<scd30::Measurement>) {
+async fn measure_co2(i2c: i2c::I2c<'static, I2C1, i2c::Async>, signals: &'static Signals) {
     let mut scd = Scd30::new(i2c, Delay);
     let version = unwrap!(scd.read_firmware_version().await);
     info!("SCD30 firmware version is {}", version);
@@ -145,7 +205,7 @@ async fn measure_co2(i2c: i2c::I2c<'static, I2C1, i2c::Async>, signal: &'static 
         let measurement = scd.read_measurement().await;
         debug!("SCD30: {}", measurement);
         match measurement {
-            Ok(m) => signal.signal(m),
+            Ok(m) => signals.co2_update.signal(m),
             Err(err) => info!("SCD30 Error: {}", &err),
         }
 

@@ -1,6 +1,9 @@
 // Need std for testing
 #![cfg_attr(not(test), no_std)]
 
+// Disallow unwrap because it uses core fmt which is large
+#![deny(clippy::unwrap_used)]
+
 use crc::{Crc, CRC_8_NRSC_5};
 use embedded_hal_async::i2c::{ErrorType, I2c};
 use num_enum::IntoPrimitive;
@@ -91,13 +94,11 @@ impl<B: I2c, D: embedded_hal_async::delay::DelayNs> Scd30<B, D> {
         Self { bus, delay }
     }
 
-    #[inline(always)]
     async fn write(&mut self, data: &[u8]) -> Result<(), B> {
         self.bus.write(ADR, data).await?;
         Ok(())
     }
 
-    #[inline(always)]
     async fn read<const N: usize>(&mut self) -> Result<[u8; N], B> {
         let mut ret = [0; N];
         self.bus.read(ADR, &mut ret).await?;

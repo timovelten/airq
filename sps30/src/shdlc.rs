@@ -58,8 +58,10 @@ impl MisoFrame {
 
         let mut cursor = 0;
 
-        let l = reader.expect_byte().await? as usize;
-        ret.rx.resize(l, 0).unwrap();
+        let l = reader.expect_byte().await?;
+
+        // This cannot fail  as ret.rx has a fixed capacity of 255, and l is a byte
+        let _ = ret.rx.resize(l as usize, 0);
 
         while cursor < ret.rx.len() {
             let read = reader.read(&mut ret.rx[cursor..]).await?;

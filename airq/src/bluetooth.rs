@@ -1,14 +1,15 @@
+use core::convert::Infallible;
+
 use bt_hci::controller::ExternalController;
 use cyw43::bluetooth::BtDriver;
-use defmt::debug;
-use defmt::info;
-use defmt::Debug2Format;
+use defmt::{unwrap, info};
 use embassy_futures::select::select;
 use embassy_futures::select::select3;
 use trouble_host::prelude::*;
 use trouble_host::Address;
 
 use crate::Signal;
+use crate::Signals;
 
 /// Size of L2CAP packets (ATT MTU is this - 4)
 const L2CAP_MTU: usize = 251;
@@ -74,8 +75,7 @@ struct CustomService {
 #[embassy_executor::task]
 pub async fn runner(
     bt_device: BtDriver<'static>,
-    pm_signal: &'static Signal<sps30::Measurement>,
-    co2_signal: &'static Signal<scd30::Measurement>,
+    signals: &'static Signals
 ) {
     let controller: ExternalController<_, 10> = ExternalController::new(bt_device);
 
@@ -88,14 +88,13 @@ pub async fn runner(
         .build();
 
     info!("Starting advertising and GATT service");
-    let server = Server::new_with_config(
+    let server = unwrap!(Server::new_with_config(
         stack,
         GapConfig::Peripheral(PeripheralConfig {
             name: "TrouBLE",
             appearance: &appearance::UNKNOWN,
         }),
-    )
-    .unwrap();
+    ));
 
     let ble_background_tasks = select(ble_task(runner), gatt_task(&server));
     let app_task = async {
@@ -106,13 +105,15 @@ pub async fn runner(
                     // run until any task ends (usually because the connection has been closed), then return to advertising state.
                     select3(
                         wait_for_connection_end(&conn),
-                        update_pm(pm_signal, &server, &conn),
-                        update_co2(co2_signal, &server, &conn),
+                        update_pm(&signals.pm_update, &server, &conn),
+                        update_co2(&signals.co2_update, &server, &conn),
                     )
                     .await;
                 }
-                Err(e) => {
-                    panic!("[adv] error: {:?}", Debug2Format(&e));
+                // Can we just talk about how cool it is that rust is able to recognize here
+                // that the other variant can never occur (because of Infalliable)?!
+                Err(BleHostError::BleHost(err)) => {
+                    defmt::panic!("[adv] error: {:?}", err);
                 }
             }
         }
@@ -135,13 +136,10 @@ async fn update_pm<C: Controller>(
         let pm4 = (values.mass_pm4 * 100.0) as u16;
         let pm10 = (values.mass_pm10 * 100.0) as u16;
 
-        let r1 = server.notify(&service.pm1, &conn, &pm1).await;
-        let r2 = server.notify(&service.pm2, &conn, &pm2).await;
-        let r3 = server.notify(&service.pm4, &conn, &pm4).await;
-        let r4 = server.notify(&service.pm10, &conn, &pm10).await;
-
-        let failures = (r1.is_ok(), r2.is_ok(), r3.is_ok(), r4.is_ok());
-        debug!("Updated PM {}", failures);
+        let _ = server.notify(&service.pm1, &conn, &pm1).await;
+        let _ = server.notify(&service.pm2, &conn, &pm2).await;
+        let _ = server.notify(&service.pm4, &conn, &pm4).await;
+        let _ = server.notify(&service.pm10, &conn, &pm10).await;
     }
 }
 
@@ -165,18 +163,18 @@ async fn update_co2<C: Controller>(
     }
 }
 
-async fn ble_task<C: Controller>(mut runner: Runner<'_, C>) {
+async fn ble_task<C: Controller<Error = Infallible>>(mut runner: Runner<'_, C>) {
     loop {
-        if let Err(e) = runner.run().await {
-            panic!("[ble_task] error: {:?}", Debug2Format(&e));
+        if let Err(BleHostError::BleHost(err)) = runner.run().await {
+            defmt::panic!("[gatt_task] error: {:?}", err);
         }
     }
 }
 
-async fn gatt_task<C: Controller>(server: &Server<'_, '_, C>) {
+async fn gatt_task<C: Controller<Error = Infallible>>(server: &Server<'_, '_, C>) {
     loop {
-        if let Err(e) = server.run().await {
-            panic!("[gatt_task] error: {:?}", Debug2Format(&e));
+        if let Err(BleHostError::BleHost(err)) = server.run().await {
+            defmt::panic!("[gatt_task] error: {:?}", err);
         }
     }
 }

@@ -1,5 +1,9 @@
 // Need std for testing
 #![cfg_attr(not(test), no_std)]
+
+// Disallow unwrap because it uses core fmt which is large
+#![deny(clippy::unwrap_used)]
+
 use embedded_hal_async::delay::DelayNs;
 use heapless::Vec;
 use num_enum::IntoPrimitive;
@@ -23,6 +27,11 @@ enum Command {
     // Note that we do not support Sleep and wakeup for
 }
 
+fn as_array<const N: usize>(xs: &[u8]) -> [u8; N] {
+    #[allow(clippy::unwrap_used)]
+    xs.try_into().unwrap()
+}
+
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 #[repr(u8)]
 #[derive(IntoPrimitive)]
@@ -35,21 +44,12 @@ pub struct Sps30<W, D> {
     delay: D,
 }
 
-#[derive(defmt::Format)]
+#[derive(defmt::Format, Debug)]
 pub enum Error<S: embedded_io::ErrorType> {
     ShdlcError(ShdlcError<S::Error>),
     InvalidUtf8,
     MisoNotOkay(MisoState),
-}
-
-impl<S: embedded_io::ErrorType> core::fmt::Debug for Error<S> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::ShdlcError(err) => write!(f, "{err:?}"),
-            Self::InvalidUtf8 => write!(f, "InvalidUtf8"),
-            Self::MisoNotOkay(state) => write!(f, "Miso state not okay: {state:?}"),
-        }
-    }
+    InvalidResponse,
 }
 
 #[derive(Debug, defmt::Format, Default)]
@@ -96,6 +96,7 @@ where
         let frame: MosiFrame<N> = MosiFrame {
             adr: 0,
             cmd: cmd.into(),
+            #[allow(clippy::unwrap_used)]
             tx: Vec::from_slice(&data).unwrap(),
         };
 
@@ -133,24 +134,35 @@ where
         self.send(Command::ReadDeviceStatusRegister, [clear as u8])
             .await?;
         let resp = self.recv_response().await?;
-        let ret = u32::from_be_bytes(resp.rx[0..4].try_into().unwrap());
+        let &[a, b, c, d, ..] = resp.rx.as_slice() else {
+            return Err(Error::InvalidResponse);
+        };
+        let ret = u32::from_be_bytes([a, b, c, d]);
+        
         Ok(ret)
     }
 
     pub async fn read_version(&mut self) -> Result<[u8; 7], S> {
         self.send(Command::ReadVersion, []).await?;
         let resp = self.recv_response().await?;
-        Ok(resp.rx[0..7].try_into().unwrap())
+        if resp.rx.len() < 7 {
+            return Err(Error::InvalidResponse);
+        }
+
+        Ok(as_array(&resp.rx[0..7]))
     }
 
     pub async fn read_measured_value(&mut self) -> Result<Measurement, S> {
         self.send(Command::ReadMeasuredValue, []).await?;
         let resp = self.recv_response().await?.rx;
-
-        fn f(x: &[u8]) -> f32 {
-            f32::from_be_bytes(x.try_into().unwrap())
+        if resp.len() < 40 {
+            return Err(Error::InvalidResponse);
         }
 
+        fn f(xs: &[u8]) -> f32 {
+            f32::from_be_bytes(as_array(xs))
+        }
+        
         let ret = Measurement {
             mass_pm1: f(&resp[0..4]),
             mass_pm2: f(&resp[4..8]),
@@ -178,8 +190,11 @@ where
         self.send(Command::ReadWriteAutoCleaningInterval, [0x00])
             .await?;
         let resp = self.recv_response().await?;
+        let &[a, b, c, d, ..] = resp.rx.as_slice() else {
+            return Err(Error::InvalidResponse);
+        };
 
-        let ret = u32::from_be_bytes(resp.rx[0..4].try_into().unwrap());
+        let ret = u32::from_be_bytes([a, b, c, d]);
         Ok(ret)
     }
 
