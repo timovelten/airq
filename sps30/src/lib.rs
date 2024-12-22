@@ -152,10 +152,12 @@ where
         Ok(as_array(&resp.rx[0..7]))
     }
 
-    pub async fn read_measured_value(&mut self) -> Result<Measurement, S> {
+    pub async fn read_measured_value(&mut self) -> Result<Option<Measurement>, S> {
         self.send(Command::ReadMeasuredValue, []).await?;
         let resp = self.recv_response().await?.rx;
-        if resp.len() < 40 {
+        if resp.len() == 0 {
+            return Ok(None);
+        } else if resp.len() < 40 {
             return Err(Error::InvalidResponse);
         }
 
@@ -176,7 +178,7 @@ where
             typical_particle_size: f(&resp[36..40]),
         };
 
-        Ok(ret)
+        Ok(Some(ret))
     }
 
     pub async fn start_fan_cleaning(&mut self) -> Result<(), S> {

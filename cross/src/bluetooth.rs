@@ -99,10 +99,14 @@ pub async fn runner(
     let ble_background_tasks = select(ble_task(runner), gatt_task(&server));
     let app_task = async {
         loop {
+            signals.active_connection.signal(false);
+
             match advertise("Pico Air Quality", &mut peripheral).await {
                 Ok(conn) => {
                     // set up tasks when the connection is established to a central, so they don't run when no one is connected.
                     // run until any task ends (usually because the connection has been closed), then return to advertising state.
+                    signals.active_connection.signal(true);
+                    
                     select3(
                         wait_for_connection_end(&conn),
                         update_pm(&signals.pm_update, &server, &conn),

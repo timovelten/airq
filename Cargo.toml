@@ -1,5 +1,5 @@
 [workspace]
-members = [ "airq", "scd30", "sps30"]
+members = [ "cross", "scd30", "sps30"]
 resolver = "2"
 
 [workspace.dependencies]

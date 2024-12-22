@@ -3,7 +3,7 @@
 
 use cortex_m_rt::entry;
 use cyw43_pio::PioSpi;
-use defmt::{debug, info, unwrap};
+use defmt::{debug, info, unwrap, warn};
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::{
     bind_interrupts, gpio::{Level, Output}, i2c::{self}, peripherals::{DMA_CH0, I2C1, PIO0, UART0}, pio::{self, Pio}, uart::{self, BufferedUart}
@@ -148,6 +148,9 @@ async fn measure_pm(uart: BufferedUart<'static, UART0>, signals: &'static Signal
                 info!("Starting PM measurement");
                 unwrap!(sps30.start_measurement().await);
 
+                // Wait for one second before actually transitioning to give the sensor time to to measure something
+                Timer::after_millis(1200).await;
+
                 state = MeasureState::Measure;
             }
             MeasureState::Stopping => {
@@ -158,10 +161,15 @@ async fn measure_pm(uart: BufferedUart<'static, UART0>, signals: &'static Signal
             }
             MeasureState::Measure => {
                 let measurement = sps30.read_measured_value().await;
-                debug!("SPS30: {}", measurement);
 
                 match measurement {
-                    Ok(m) => signals.pm_update.signal(m),
+                    Ok(Some(m)) => {
+                        debug!("SPS30: {}", m);
+                        signals.pm_update.signal(m);
+                    }
+                    Ok(None) => {
+                        warn!("SPS30: No measurement data available");
+                    }
                     Err(err) => info!("SPS30 Error: {}", &err),
                 }
 
@@ -203,9 +211,11 @@ async fn measure_co2(i2c: i2c::I2c<'static, I2C1, i2c::Async>, signals: &'static
 
     loop {
         let measurement = scd.read_measurement().await;
-        debug!("SCD30: {}", measurement);
         match measurement {
-            Ok(m) => signals.co2_update.signal(m),
+            Ok(m) => {
+                debug!("SCD30: {}", m);
+                signals.co2_update.signal(m);
+            }
             Err(err) => info!("SCD30 Error: {}", &err),
         }
 
