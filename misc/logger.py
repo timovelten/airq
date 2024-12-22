@@ -60,7 +60,7 @@ async def run(client: BleakClient):
             file.flush()
             print(meas)
 
-            await asyncio.sleep(1)
+            await asyncio.sleep(15)
 
 async def main():
     dev = await BleakScanner.find_device_by_address("E8:83:1E:E3:5A:41")

@@ -2,7 +2,8 @@ use core::convert::Infallible;
 
 use bt_hci::controller::ExternalController;
 use cyw43::bluetooth::BtDriver;
-use defmt::{unwrap, info};
+use defmt::warn;
+use defmt::{info, unwrap};
 use embassy_futures::select::select;
 use embassy_futures::select::select3;
 use trouble_host::prelude::*;
@@ -73,30 +74,25 @@ struct CustomService {
 }
 
 #[embassy_executor::task]
-pub async fn runner(
-    bt_device: BtDriver<'static>,
-    signals: &'static Signals
-) {
+pub async fn runner(bt_device: BtDriver<'static>, signals: &'static Signals) {
     let controller: ExternalController<_, 10> = ExternalController::new(bt_device);
 
     let address = Address::random([0x41, 0x5A, 0xE3, 0x1E, 0x83, 0xE8]);
     info!("Our address = {:?}", address);
 
     let mut resources = Resources::new(PacketQos::None);
-    let (stack, mut peripheral, _, runner) = trouble_host::new(controller, &mut resources)
+    let (_stack, mut peripheral, _, runner) = trouble_host::new(controller, &mut resources)
         .set_random_address(address)
         .build();
 
     info!("Starting advertising and GATT service");
     let server = unwrap!(Server::new_with_config(
-        stack,
         GapConfig::Peripheral(PeripheralConfig {
             name: "TrouBLE",
             appearance: &appearance::UNKNOWN,
         }),
     ));
 
-    let ble_background_tasks = select(ble_task(runner), gatt_task(&server));
     let app_task = async {
         loop {
             signals.active_connection.signal(false);
@@ -106,9 +102,9 @@ pub async fn runner(
                     // set up tasks when the connection is established to a central, so they don't run when no one is connected.
                     // run until any task ends (usually because the connection has been closed), then return to advertising state.
                     signals.active_connection.signal(true);
-                    
+
                     select3(
-                        wait_for_connection_end(&conn),
+                        conn_task(&conn, &server),
                         update_pm(&signals.pm_update, &server, &conn),
                         update_co2(&signals.co2_update, &server, &conn),
                     )
@@ -122,12 +118,12 @@ pub async fn runner(
             }
         }
     };
-    select(ble_background_tasks, app_task).await;
+    select(ble_task(runner), app_task).await;
 }
 
-async fn update_pm<C: Controller>(
+async fn update_pm(
     pm_signal: &'static Signal<sps30::Measurement>,
-    server: &Server<'_, '_, C>,
+    server: &Server<'_>,
     conn: &Connection<'_>,
 ) {
     let service = &server.custom;
@@ -140,16 +136,16 @@ async fn update_pm<C: Controller>(
         let pm4 = (values.mass_pm4 * 100.0) as u16;
         let pm10 = (values.mass_pm10 * 100.0) as u16;
 
-        let _ = server.notify(&service.pm1, &conn, &pm1).await;
-        let _ = server.notify(&service.pm2, &conn, &pm2).await;
-        let _ = server.notify(&service.pm4, &conn, &pm4).await;
-        let _ = server.notify(&service.pm10, &conn, &pm10).await;
+        let _ = service.pm1.notify(server, conn, &pm1).await;
+        let _ = service.pm2.notify(server, conn, &pm2).await;
+        let _ = service.pm4.notify(server, conn, &pm4).await;
+        let _ = service.pm10.notify(server, conn, &pm10).await;
     }
 }
 
-async fn update_co2<C: Controller>(
+async fn update_co2(
     co2_signal: &'static Signal<scd30::Measurement>,
-    server: &Server<'_, '_, C>,
+    server: &Server<'_>,
     conn: &Connection<'_>,
 ) {
     let service = &server.custom;
@@ -161,9 +157,9 @@ async fn update_co2<C: Controller>(
         let temp = (values.temperature * 100.0) as i16;
         let rh = (values.relative_humidity * 100.0) as u16;
 
-        let _ = server.notify(&service.co2, &conn, &co2).await;
-        let _ = server.notify(&service.relative_humidity, &conn, &rh).await;
-        let _ = server.notify(&service.temperature, &conn, &temp).await;
+        let _ = service.co2.notify(&server, &conn, &co2).await;
+        let _ = service.relative_humidity.notify(&server, &conn, &rh).await;
+        let _ = service.temperature.notify(&server, &conn, &temp).await;
     }
 }
 
@@ -175,22 +171,22 @@ async fn ble_task<C: Controller<Error = Infallible>>(mut runner: Runner<'_, C>) 
     }
 }
 
-async fn gatt_task<C: Controller<Error = Infallible>>(server: &Server<'_, '_, C>) {
-    loop {
-        if let Err(BleHostError::BleHost(err)) = server.run().await {
-            defmt::panic!("[gatt_task] error: {:?}", err);
-        }
-    }
-}
-
-async fn wait_for_connection_end(conn: &Connection<'_>) {
+async fn conn_task(conn: &Connection<'_>, server: &Server<'_>) {
     loop {
         match conn.next().await {
             ConnectionEvent::Disconnected { reason } => {
                 info!("[gatt] disconnected: {:?}", reason);
                 break;
-            },
-            _ => {}
+            }
+            ConnectionEvent::Gatt { data } => {
+                // Trouble automatically responds to events when they are dropped
+                match data.process(server).await {
+                    Ok(_) => {},
+                    Err(e) => {
+                        warn!("[gatt] error processing event {}", e)
+                    }
+                }
+            }
         }
     }
 
