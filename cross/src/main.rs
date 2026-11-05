@@ -2,11 +2,18 @@
 #![no_main]
 
 use cortex_m_rt::entry;
-use cyw43_pio::PioSpi;
+use cyw43::{Cyw43439, aligned_bytes, bluetooth::BtDriver};
+use cyw43_pio::{PioSpi, DEFAULT_CLOCK_DIVIDER};
 use defmt::{debug, info, unwrap, warn};
 use embassy_executor::{Executor, Spawner};
 use embassy_rp::{
-    bind_interrupts, gpio::{Level, Output}, i2c::{self}, peripherals::{DMA_CH0, I2C1, PIO0, UART0}, pio::{self, Pio}, uart::{self, BufferedUart}
+    bind_interrupts, dma,
+    gpio::{Level, Output},
+    i2c::{self},
+    mode::Async,
+    peripherals::{DMA_CH0, DMA_CH1, I2C1, PIO0, UART0},
+    pio::{self, Pio},
+    uart::{self, BufferedUart},
 };
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{with_deadline, Delay, Duration, Instant, Timer};
@@ -15,6 +22,7 @@ use rtt_target::rtt_init_defmt;
 use scd30::Scd30;
 use sps30::Sps30;
 use static_cell::StaticCell;
+use trouble_host::prelude::ExternalController;
 
 mod bluetooth;
 
@@ -22,6 +30,7 @@ bind_interrupts!(struct Irqs {
     PIO0_IRQ_0 => pio::InterruptHandler<PIO0>;
     UART0_IRQ => uart::BufferedInterruptHandler<UART0>;
     I2C1_IRQ => i2c::InterruptHandler<I2C1>;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
 });
 
 static EXECUTOR: StaticCell<Executor> = StaticCell::new();
@@ -32,7 +41,7 @@ type Signal<T> = embassy_sync::signal::Signal<CriticalSectionRawMutex, T>;
 struct Signals {
     pub pm_update: Signal<sps30::Measurement>,
     pub co2_update: Signal<scd30::Measurement>,
-    pub active_connection: Signal<bool>
+    pub active_connection: Signal<bool>,
 }
 
 impl Signals {
@@ -40,7 +49,7 @@ impl Signals {
         Self {
             pm_update: Signal::new(),
             co2_update: Signal::new(),
-            active_connection: Signal::new()
+            active_connection: Signal::new(),
         }
     }
 }
@@ -53,7 +62,7 @@ fn main() -> ! {
 
     let executor = EXECUTOR.init_with(|| Executor::new());
     executor.run(|spawner| {
-        spawner.must_spawn(async_main(spawner));
+        spawner.spawn(unwrap!(async_main(spawner)));
     });
 }
 
@@ -66,18 +75,31 @@ async fn async_main(spawner: Spawner) {
     //
     static STATE: StaticCell<cyw43::State> = StaticCell::new();
 
-    let fw = include_bytes!("../blobs/43439A0.bin");
-    let clm = include_bytes!("../blobs/43439A0_clm.bin");
-    let btfw = include_bytes!("../blobs/43439A0_btfw.bin");
+    let fw = aligned_bytes!("../blobs/43439A0.bin");
+    let clm = aligned_bytes!("../blobs/43439A0_clm.bin");
+    let btfw = aligned_bytes!("../blobs/43439A0_btfw.bin");
+    let nvram = aligned_bytes!("../blobs/nvram_rp2040.bin");
 
     let pwr = Output::new(p.PIN_23, Level::Low);
     let cs = Output::new(p.PIN_25, Level::High);
     let mut pio = Pio::new(p.PIO0, Irqs);
-    let spi = PioSpi::new(&mut pio.common, pio.sm0, pio.irq0, cs, p.PIN_24, p.PIN_29, p.DMA_CH0);
+    let spi = PioSpi::new(
+        &mut pio.common,
+        pio.sm0,
+        DEFAULT_CLOCK_DIVIDER,
+        pio.irq0,
+        cs,
+        p.PIN_24,
+        p.PIN_29,
+        dma::Channel::new(p.DMA_CH0, Irqs),
+        dma::Channel::new(p.DMA_CH1, Irqs),
+    );
 
     let state = STATE.init(cyw43::State::new());
-    let (_net_device, bt_device, mut control, runner) = cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw).await;
-    unwrap!(spawner.spawn(cyw43_task(runner)));
+    let (_net_device, bt_device, mut control, runner) =
+        cyw43::new_with_bluetooth(state, pwr, spi, fw, btfw, nvram).await;
+
+    spawner.spawn(unwrap!(cyw43_task(runner)));
     control.init(clm).await;
 
     //
@@ -90,9 +112,9 @@ async fn async_main(spawner: Spawner) {
     let rx_buf = &mut RX_BUF.init([0; 16])[..];
     let uart_sps30 = BufferedUart::new(
         p.UART0,
-        Irqs,
         p.PIN_16,
         p.PIN_17,
+        Irqs,
         tx_buf,
         rx_buf,
         Default::default(),
@@ -102,30 +124,37 @@ async fn async_main(spawner: Spawner) {
     // I2C for SCD30
     //
     let mut i2c_config: i2c::Config = Default::default();
-    i2c_config.frequency = 50_000;
-    let i2c = i2c::I2c::new_async(
-        p.I2C1,
-        p.PIN_15,
-        p.PIN_14,
-        Irqs,
-        i2c_config,
-    );
+    i2c_config.frequency = embassy_rp::time::Hertz(50_000);
+    let i2c = i2c::I2c::new(p.I2C1, p.PIN_15, p.PIN_14, Irqs, i2c_config);
 
     // Setup the actual application
     static SIGNALS: Signals = Signals::new();
 
-    unwrap!(spawner.spawn(bluetooth::runner(bt_device, &SIGNALS)));
-    unwrap!(spawner.spawn(measure_pm(uart_sps30, &SIGNALS)));
-    unwrap!(spawner.spawn(measure_co2(i2c, &SIGNALS)));
+    spawner.spawn(unwrap!(bluetooth_task(bt_device, &SIGNALS)));
+    spawner.spawn(unwrap!(measure_pm(uart_sps30, &SIGNALS)));
+    spawner.spawn(unwrap!(measure_co2(i2c, &SIGNALS)));
 }
 
 #[embassy_executor::task]
-async fn cyw43_task(runner: cyw43::Runner<'static, Output<'static>, PioSpi<'static, PIO0, 0, DMA_CH0>>) -> ! {
+async fn bluetooth_task(bt_device: BtDriver<'static>, signals: &'static Signals) -> ! {
+    let controller: ExternalController<_, 10> = ExternalController::new(bt_device);
+    bluetooth::run(controller, signals).await;
+    loop {}
+}
+
+#[embassy_executor::task]
+async fn cyw43_task(
+    runner: cyw43::Runner<
+        'static,
+        cyw43::SpiBus<Output<'static>, PioSpi<'static, PIO0, 0>>,
+        Cyw43439,
+    >,
+) -> ! {
     runner.run().await
 }
 
 #[embassy_executor::task]
-async fn measure_pm(uart: BufferedUart<'static, UART0>, signals: &'static Signals) {
+async fn measure_pm(uart: BufferedUart<'static>, signals: &'static Signals) {
     let mut sps30 = Sps30::new(uart, Delay);
 
     // Reset because resetting the pico does not necessarily reset the sensor itself
@@ -137,7 +166,7 @@ async fn measure_pm(uart: BufferedUart<'static, UART0>, signals: &'static Signal
         Idle(embassy_time::Instant),
         Inactive,
         Starting,
-        Stopping
+        Stopping,
     }
 
     let mut state = MeasureState::Inactive;
@@ -174,7 +203,6 @@ async fn measure_pm(uart: BufferedUart<'static, UART0>, signals: &'static Signal
                 }
 
                 state = MeasureState::Idle(Instant::now() + Duration::from_secs(10));
-
             }
             MeasureState::Idle(deadline) => {
                 // Idle between measurements. We either wait for a set time, or find out that we should transition
@@ -185,7 +213,7 @@ async fn measure_pm(uart: BufferedUart<'static, UART0>, signals: &'static Signal
                     Ok(true) => {
                         // Do nothing, measurement stays active. At some point, the deadline will expire and
                         // we will transition to measure again
-                    },
+                    }
                     Ok(false) => {
                         state = MeasureState::Stopping;
                     }
@@ -204,7 +232,7 @@ async fn measure_pm(uart: BufferedUart<'static, UART0>, signals: &'static Signal
 }
 
 #[embassy_executor::task]
-async fn measure_co2(i2c: i2c::I2c<'static, I2C1, i2c::Async>, signals: &'static Signals) {
+async fn measure_co2(i2c: i2c::I2c<'static, Async>, signals: &'static Signals) {
     let mut scd = Scd30::new(i2c, Delay);
     let version = unwrap!(scd.read_firmware_version().await);
     info!("SCD30 firmware version is {}", version);

@@ -1,3 +1,5 @@
+use core::fmt::{Debug, Display};
+
 use embedded_io_async::{BufRead, ErrorType, Read as _, Write};
 use num_enum::{FromPrimitive, IntoPrimitive};
 
@@ -132,7 +134,7 @@ impl<W: embedded_io_async::Write> FrameWriter<W> {
         }
     }
 
-    pub async fn write_checksum(&mut self) -> Result<u8, <Self as ErrorType>::Error> {
+    pub async fn write_checksum(&mut self) -> Result<u8, ShdlcError<W::Error>> {
         // As far as I understand the docs, it is possible for the checksum to be equal
         // to one of the escape characters (and in that case we have to escape it)
         let checksum = !self.checksum;
@@ -141,8 +143,8 @@ impl<W: embedded_io_async::Write> FrameWriter<W> {
         Ok(checksum)
     }
 
-    pub async fn finish(&mut self) -> Result<(), <Self as ErrorType>::Error> {
-        self.inner.write(&[0x7e]).await?;
+    pub async fn finish(&mut self) -> Result<(), ShdlcError<W::Error>> {
+        self.inner.write(&[0x7e]).await.map_err(ShdlcError::Io)?;
         self.state = WriterState::Done;
         Ok(())
     }
@@ -154,13 +156,16 @@ impl<W: embedded_io_async::Write> FrameWriter<W> {
     }
 }
 
-impl<W: embedded_io_async::Write> ErrorType for FrameWriter<W> {
+impl<W: embedded_io_async::Write> ErrorType for FrameWriter<W>
+where
+    W::Error:,
+{
     type Error = ShdlcError<W::Error>;
 }
 
 impl<W: embedded_io_async::Write> embedded_io_async::Write for FrameWriter<W> {
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        self.inner.flush().await?;
+        self.inner.flush().await.map_err(ShdlcError::Io)?;
         Ok(())
     }
 
@@ -171,7 +176,7 @@ impl<W: embedded_io_async::Write> embedded_io_async::Write for FrameWriter<W> {
             WriterState::SentStart => {}
             WriterState::Nothing => {
                 // Send start
-                self.inner.write(&[0x7e]).await?;
+                self.inner.write(&[0x7e]).await.map_err(ShdlcError::Io)?;
                 self.state = WriterState::SentStart;
             }
         }
@@ -182,7 +187,7 @@ impl<W: embedded_io_async::Write> embedded_io_async::Write for FrameWriter<W> {
         if let Some(i) = ctrl_index {
             // Try and write data that is free of ctrl index
             let rem = &buf[..i];
-            self.inner.write_all(rem).await?;
+            self.inner.write_all(rem).await.map_err(ShdlcError::Io)?;
             self.bytes_for_checksum(rem);
 
             // Write the control byte itself
@@ -193,12 +198,12 @@ impl<W: embedded_io_async::Write> embedded_io_async::Write for FrameWriter<W> {
                 0x13 => [0x7d, 0x33],
                 _ => unreachable!(),
             };
-            self.inner.write_all(&cs).await?;
+            self.inner.write_all(&cs).await.map_err(ShdlcError::Io)?;
             self.bytes_for_checksum(&buf[i..i + 1]);
 
             Ok(i + 1)
         } else {
-            self.inner.write_all(buf).await?;
+            self.inner.write_all(buf).await.map_err(ShdlcError::Io)?;
             self.bytes_for_checksum(buf);
             Ok(buf.len())
         }
@@ -230,7 +235,7 @@ impl<R: embedded_io_async::BufRead> FrameReader<R> {
 
     pub async fn read_byte(&mut self) -> Result<Option<u8>, <Self as ErrorType>::Error> {
         let ret = loop {
-            let buf = self.inner.fill_buf().await?;
+            let buf = self.inner.fill_buf().await.map_err(ShdlcError::Io)?;
 
             // We go byte by byte anway. But note that we do not necessarily consume this byte
             let b = buf.first().copied();
@@ -243,7 +248,7 @@ impl<R: embedded_io_async::BufRead> FrameReader<R> {
                     self.state = ReaderState::Reading;
 
                     // Do not break. Continue and actually get some data
-                },
+                }
                 (ReaderState::ExpectStart, _) => return Err(ShdlcError::ExpectedStart),
                 (ReaderState::Reading, None) => return Err(ShdlcError::ExpectedEnd),
                 (ReaderState::Reading, Some(b)) => {
@@ -252,13 +257,13 @@ impl<R: embedded_io_async::BufRead> FrameReader<R> {
                     match b {
                         0x7e => {
                             self.state = ReaderState::Done;
-                            break None
-                        },
+                            break None;
+                        }
                         0x7d => {
                             self.state = ReaderState::ExpectEscapedByte;
-                            continue
-                        },
-                        b => break Some(b)
+                            continue;
+                        }
+                        b => break Some(b),
                     }
                 }
                 (ReaderState::ExpectEscapedByte, b) => {
@@ -267,7 +272,7 @@ impl<R: embedded_io_async::BufRead> FrameReader<R> {
                         Some(0x5d) => 0x7d,
                         Some(0x31) => 0x11,
                         Some(0x33) => 0x13,
-                        _ => return Err(ShdlcError::ExpectedEscapedByte)
+                        _ => return Err(ShdlcError::ExpectedEscapedByte),
                     };
                     self.inner.consume(1);
 
@@ -299,7 +304,7 @@ impl<R: embedded_io_async::BufRead> FrameReader<R> {
     pub async fn finish(&mut self) -> Result<(), <Self as ErrorType>::Error> {
         loop {
             if self.state == ReaderState::Done {
-                return Ok(())
+                return Ok(());
             }
 
             let _ = self.read_byte().await?;
@@ -339,20 +344,21 @@ pub enum ShdlcError<E> {
     ChecksumMismatch,
     /// Writer is done and will not accept any more data
     Done,
-    Other(E),
+    Io(E),
 }
 
-impl<E> From<E> for ShdlcError<E> {
-    fn from(value: E) -> Self {
-        Self::Other(value)
+impl<E: Debug> Display for ShdlcError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{self:?}")
     }
 }
+
+impl<E: Debug> core::error::Error for ShdlcError<E> {}
 
 impl<E: embedded_io::Error> embedded_io::Error for ShdlcError<E> {
     fn kind(&self) -> embedded_io::ErrorKind {
         match self {
-            Self::Other(err) => err.kind(),
-            Self::Done => embedded_io::ErrorKind::WriteZero,
+            Self::Io(e) => e.kind(),
             _ => embedded_io::ErrorKind::Other,
         }
     }
@@ -411,7 +417,10 @@ mod test {
 
         let mut cursor = 0;
         while cursor < hopefully_src.len() {
-            let read = reader.read(&mut &mut hopefully_src[cursor..]).await.unwrap();
+            let read = reader
+                .read(&mut &mut hopefully_src[cursor..])
+                .await
+                .unwrap();
             if read == 0 {
                 panic!("Not enough data");
             }
@@ -446,7 +455,8 @@ mod test {
         send_and_read(
             &[0x7e, 0x13, 0xe7, 0xe7, 0x6e, 0x32, 0x56, 0x74, 0xca, 0x21],
             None,
-        ).await;
+        )
+        .await;
     }
 
     #[test_log::test(apply(test!))]
@@ -455,7 +465,9 @@ mod test {
         let frames: [&'static [u8]; 3] = [
             &[0x00, 0x00, 0x00, 0x00, 0xFF],
             &[0x00, 0x00, 0x00, 0x00, 0xFF],
-            &[0x00, 0xD0, 0x00, 0x09, 0x30, 0x30, 0x30, 0x38, 0x30, 0x30, 0x30, 0x30, 0x00]
+            &[
+                0x00, 0xD0, 0x00, 0x09, 0x30, 0x30, 0x30, 0x38, 0x30, 0x30, 0x30, 0x30, 0x00,
+            ],
         ];
 
         for frame in frames {
@@ -464,7 +476,7 @@ mod test {
             writer.write_checksum().await.unwrap();
             writer.finish().await.unwrap();
         }
-        
+
         let mut reader = &msg[..];
         for _ in 0..3 {
             let _ = MisoFrame::recv(&mut reader).await.unwrap();
@@ -486,7 +498,5 @@ mod test {
     }
 
     #[apply(test)]
-    async fn truncates_data() {
-
-    }
+    async fn truncates_data() {}
 }
