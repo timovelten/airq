@@ -1,0 +1,162 @@
+<html>
+  <head>
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/@picocss/pico@latest/css/pico.min.css"
+    />
+  </head>
+  <body>
+    <main
+      style="
+        display: flex;
+        flex-direction: column;
+        max-width: 600px;
+        margin-inline: auto;
+      "
+      x-data="main"
+    >
+      <template x-if="!started">
+        <button @click="start()">Start</button>
+      </template>
+      <template x-if="started">
+        <div style="display: flex; flex-direction: column">
+          <button @click="stop()">Stop</button>
+          <p>Temperature: <span x-text="fmt(temp)"></span> &deg;C</p>
+          <p>CO2: <span x-text="fmt(co2)"></span> ppm</p>
+          <p>PM1: <span x-text="fmt(pm1)"></span> &mu;g / m&#xb3;</p>
+          <p>PM2.5: <span x-text="fmt(pm2)"></span> &mu;g / m&#xb3;</p>
+          <p>PM4: <span x-text="fmt(pm4)"></span> &mu;g / m&#xb3;</p>
+          <p>PM10: <span x-text="fmt(pm10)"></span> &mu;g / m&#xb3;</p>
+        </div>
+      </template>
+    </main>
+
+    <script src="https://unpkg.com/alpinejs" defer></script>
+  </body>
+  <script>
+    document.addEventListener("alpine:init", () => {
+      Alpine.data("main", () => ({
+        started: null,
+        temp: null,
+        co2: null,
+        pm1: null,
+        pm2: null,
+        pm4: null,
+        pm10: null,
+
+        init() {
+          window.addEventListener("new-measurements", (e) =>
+            Object.assign(this, e.detail),
+          );
+        },
+
+        async start() {
+          const res = await onStartClick();
+          if (res.success) {
+            this.started = res;
+            console.log(res);
+            console.log("Started");
+          }
+        },
+
+        stop() {
+          if (this.started == null) return;
+          this.started.stop();
+          this.started = null;
+        },
+      }));
+    });
+
+    function fmt(x, d = 2) {
+      if (x == null) {
+        return "-";
+      }
+
+      return x.toFixed(2);
+    }
+
+    function isWebBluetoothEnabled() {
+      if (navigator.bluetooth) {
+        return true;
+      } else {
+        alert("Web Bluetooth is either not supported or not enabled");
+        return false;
+      }
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function ble(device, signal) {
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(
+        "0e201142-fba1-43a9-b7c9-49020b000000",
+      );
+
+      const ff = async function (charUuid) {
+        const char = await service.getCharacteristic(charUuid);
+        const val = await char.readValue();
+        return val.getUint16(0, true) / 100;
+      };
+
+      const fi = async function (charUuid) {
+        const char = await service.getCharacteristic(charUuid);
+        const val = await char.readValue();
+        return val.getUint16(0, true);
+      };
+
+      while (!signal.aborted) {
+        const measurement = {
+          temp: await ff(0x2a6e),
+          relative_humidity: await ff(0x2a6f),
+          co2: await fi(0x2b8c),
+          pm1: await ff("0e201142-fba1-43a9-b7c9-49020b000001"),
+          pm2: await ff("0e201142-fba1-43a9-b7c9-49020b000002"),
+          pm4: await ff("0e201142-fba1-43a9-b7c9-49020b000004"),
+          pm10: await ff("0e201142-fba1-43a9-b7c9-49020b000010"),
+        };
+
+        console.log("Got " + measurement);
+        window.dispatchEvent(
+          new CustomEvent("new-measurements", { detail: measurement }),
+        );
+
+        await sleep(1000);
+      }
+
+      console.log("Disconnecting");
+      device.gatt.disconnect();
+    }
+    function formatWithPrecision(val, precision) {
+      const formattingOptions = {
+        maximumFractionDigits: precision,
+        minimumFractionDigits: precision,
+      };
+      return val.toLocaleString(undefined, formattingOptions);
+    }
+
+    async function onStartClick() {
+      if (!isWebBluetoothEnabled()) {
+        return;
+      }
+
+      const device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: "Pico" }],
+        // There is some same origin policy in place. We are not allowed to access a service we do not declare.
+        optionalServices: ["0e201142-fba1-43a9-b7c9-49020b000000"],
+      });
+
+      const controller = new AbortController();
+
+      ble(device, controller.signal);
+
+      return {
+        success: true,
+        stop: () => {
+          controller.abort();
+        },
+      };
+    }
+  </script>
+</html>
